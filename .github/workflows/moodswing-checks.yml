@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
-      MOODSWING_BLOCK_ON_FINDINGS: 'false'
+      MOODSWING_BLOCK_ON_FINDINGS: 'true'
     steps:
       - name: Check out source as data
         uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
@@ -54,6 +54,8 @@ jobs:
           set -euo pipefail
           mkdir -p moodswing-results
           printf '[extend]\nuseDefault = true\n' > moodswing-gitleaks.toml
+          printf '%s\n' '[[rules]]' 'id = "moodswing-qa-fixture"' 'description = "Synthetic QA marker"' 'regex = "MOODSWING_QA_MARKER_[0-9]+"' >> moodswing-gitleaks.toml
+          printf 'MOODSWING_QA_%s_%s\n' MARKER 12345 > "$GITHUB_WORKSPACE/moodswing-scanner-fixture.txt"
           touch moodswing-gitleaksignore moodswing-osv.toml
           printf '[]\n' > moodswing-secrets.json
 
