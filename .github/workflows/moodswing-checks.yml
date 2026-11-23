@@ -1,0 +1,131 @@
+name: Moodswing
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: moodswing-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    name: Moodswing security checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      MOODSWING_BLOCK_ON_FINDINGS: 'false'
+    steps:
+      - name: Check out source as data
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install verified scanners
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          mkdir -p moodswing-bin
+          curl --fail --silent --show-error --location --proto '=https' --max-time 90 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o gitleaks.tar.gz
+          curl --fail --silent --show-error --location --proto '=https' --max-time 90 \
+            https://github.com/google/osv-scanner/releases/download/v2.7.1/osv-scanner_linux_amd64 -o moodswing-bin/osv-scanner
+          printf '%s\n' \
+            '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz' \
+            'fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8  moodswing-bin/osv-scanner' | sha256sum -c -
+          tar -xzf gitleaks.tar.gz -C moodswing-bin gitleaks
+          chmod +x moodswing-bin/osv-scanner
+
+      - name: Scan for secrets and known dependency vulnerabilities
+        id: scan
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          mkdir -p moodswing-results
+          printf '[extend]\nuseDefault = true\n' > moodswing-gitleaks.toml
+          touch moodswing-gitleaksignore moodswing-osv.toml
+          printf '[]\n' > moodswing-secrets.json
+
+          secret_exit=0
+          ./moodswing-bin/gitleaks dir --config "$PWD/moodswing-gitleaks.toml" \
+            --gitleaks-ignore-path "$PWD/moodswing-gitleaksignore" --ignore-gitleaks-allow \
+            --redact=100 --report-format json --report-path "$PWD/moodswing-secrets.json" \
+            --exit-code 42 "$GITHUB_WORKSPACE" >/dev/null 2>&1 || secret_exit=$?
+
+          dep_exit=0
+          dep_ran=false
+          args=()
+          find "$GITHUB_WORKSPACE" -name .git -prune -o -type f \
+            \( -name package-lock.json -o -name npm-shrinkwrap.json -o -name pnpm-lock.yaml \
+            -o -name yarn.lock -o -name Cargo.lock -o -name poetry.lock -o -name uv.lock \
+            -o -name Pipfile.lock -o -name composer.lock -o -name Gemfile.lock \
+            -o -name go.sum -o -name packages.lock.json \) -print0 > moodswing-lockfiles
+          while IFS= read -r -d '' lockfile; do
+            args+=("--lockfile=:$lockfile")
+          done < moodswing-lockfiles
+          if (( ${#args[@]} > 0 )); then
+            dep_ran=true
+            ./moodswing-bin/osv-scanner scan source --config "$PWD/moodswing-osv.toml" \
+              --no-call-analysis=go --format json "${args[@]}" \
+              > moodswing-dependencies.json 2>/dev/null || dep_exit=$?
+          fi
+
+          secrets='Scanner error'
+          dependencies='Skipped (no supported lockfiles found)'
+          failed=false
+          if [[ "$secret_exit" == 0 || "$secret_exit" == 42 ]]; then
+            secrets='No matches'
+            if [[ "$secret_exit" == 42 ]]; then secrets='Potential secrets found'; fi
+            jq -e --arg root "$GITHUB_WORKSPACE/" \
+              'map({rule: .RuleID, file: (.File | ltrimstr($root)), line: .StartLine})' \
+              moodswing-secrets.json > moodswing-results/secrets.json || failed=true
+          else
+            failed=true
+          fi
+          if [[ "$dep_ran" == true ]]; then
+            case "$dep_exit" in
+              0|1)
+                dependencies='No known vulnerabilities found'
+                if [[ "$dep_exit" == 1 ]]; then dependencies='Known vulnerabilities found'; fi
+                jq -e '[.results[]?.packages[]? | {package: {name: .package.name, version: .package.version, ecosystem: .package.ecosystem}, advisories: [.vulnerabilities[]?.id]} | select(.advisories | length > 0)]' \
+                  moodswing-dependencies.json > moodswing-results/dependencies.json || failed=true
+                ;;
+              128) dependencies='Skipped (no packages resolved from lockfiles)' ;;
+              *) dependencies='Scanner error'; failed=true ;;
+            esac
+          fi
+
+          {
+            printf '## Moodswing security checks\n\n'
+            printf '| Check | Result |\n| --- | --- |\n'
+            printf '| Secrets | %s |\n| Dependencies | %s |\n' "$secrets" "$dependencies"
+            printf '\nSee the redacted results artifact for details.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$failed" == true ]]; then
+            printf '%s\n' 'A scanner did not complete. Review the job summary.'
+            exit 2
+          fi
+          if [[ "$secret_exit" == 42 || "$dep_exit" == 1 ]]; then
+            printf '%s\n' 'Security findings were reported. Review the job summary.'
+            if [[ "$MOODSWING_BLOCK_ON_FINDINGS" == true ]]; then exit 1; fi
+          fi
+
+      - name: Save redacted check results
+        if: always() && steps.scan.outcome != 'skipped'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: moodswing-security-results
+          path: ${{ runner.temp }}/moodswing-results/
+          if-no-files-found: ignore
+          retention-days: 14
